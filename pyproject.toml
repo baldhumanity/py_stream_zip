@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py-stream-zip"
+version = "0.1.0"
+description = "A stream-based ZIP file extractor in Python, inspired by node-stream-zip."
+readme = "README.md"
+requires-python = ">=3.6"
+license = { file = "LICENSE" }
+authors = [
+    { name = "David Bald", email = "baldhumanity@gmail.com" }
+]
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent"
+]
+
+[project.urls]
+Homepage = "https://github.com/baldhumanity/py-stream-zip"
+Repository = "https://github.com/baldhumanity/py-stream-zip"
+Credits = "https://github.com/antelle/node-stream-zip"
