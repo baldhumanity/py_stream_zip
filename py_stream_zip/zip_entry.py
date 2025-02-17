@@ -24,6 +24,11 @@ class ZipEntry:
         self.name = None
         self.is_directory = False
         self.comment = None
+        # Attributes used for lazy parsing:
+        # _cd_data: memoryview of the central directory block.
+        # _variable_offset: start offset for variable-length fields.
+        # _variable_size: total size of variable-length fields.
+        # _parsed_lazy: flag indicating whether lazy fields have been parsed.
 
     def read_header(self, data, offset=0):
         """
@@ -200,3 +205,25 @@ class ZipEntry:
             offset += 8
         if len(data) >= offset + 4 and self.disk_start == constants.EF_ZIP64_OR_16:
             self.disk_start = struct.unpack_from("<I", data, offset)[0]
+
+    def ensure_parsed(self, encoding="utf-8"):
+        """
+        For lazy-loaded entries, parse the remaining variable-length fields (extra and comment)
+        that were deferred during initial central directory parsing.
+        """
+        if getattr(self, "_parsed_lazy", True):
+            return  # Already parsed
+        # Calculate offset inside the stored _cd_data (a memoryview) from which to parse extra/comment.
+        offset = self._variable_offset + self.fname_len
+        # Parse extra field if available:
+        if self.extra_len:
+            extra_bytes = self._cd_data[offset : offset + self.extra_len].tobytes()
+            self.read_extra(extra_bytes)
+            offset += self.extra_len
+        # Parse comment if available:
+        if self.com_len:
+            comment_bytes = self._cd_data[offset : offset + self.com_len].tobytes()
+            self.comment = comment_bytes.decode(encoding, errors="replace")
+        else:
+            self.comment = None
+        self._parsed_lazy = True

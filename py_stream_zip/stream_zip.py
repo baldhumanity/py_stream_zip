@@ -12,17 +12,26 @@ from .central_directory import (
 
 
 class StreamZip:
-    def __init__(self, file, store_entries=True, chunk_size=None, encoding="utf-8"):
+    def __init__(
+        self,
+        file,
+        store_entries=True,
+        lazy_entries=False,
+        chunk_size=None,
+        encoding="utf-8",
+    ):
         """
         Initialize a StreamZip instance.
 
         :param file: Path to ZIP file or a file-like object (opened in binary mode).
         :param store_entries: If True then store entries in a dict for random access.
+        :param lazy_entries: If True then defer parsing of variable-length fields for each entry until needed.
         :param chunk_size: Not used in this synchronous version but kept for parity.
         :param encoding: Filename encoding.
         """
         self.encoding = encoding
         self.store_entries = store_entries
+        self.lazy_entries = lazy_entries
         self.entries = {} if store_entries else None
         self.entries_count = 0
         self.comment = None
@@ -108,39 +117,60 @@ class StreamZip:
     def _read_entries(self):
         """
         Read the central directory entries from the ZIP file.
-
-        Process:
-          1. Seek to the starting offset of the central directory (from the EOCD header).
-          2. Read the entire central directory block.
-          3. Iterate over each entry (using the volume_entries count):
-             - Read the fixed-size header.
-             - Read the variable-length fields (filename, extra data, and comment).
-             - Create and populate a ZipEntry instance.
-          4. Optionally, store the entry in a dictionary for quick look-up.
+        Depending on the lazy_entries flag, parse the variable-length fields now or later.
         """
         cd_offset = self._central_dir_header.offset
         cd_size = self._central_dir_header.size
         self._fp.seek(cd_offset)
-        cd_data = self._fp.read(cd_size)
-        pos = 0
-        entry_count = self._central_dir_header.volume_entries
-        for _ in range(entry_count):
-            # Check sufficient data for the fixed-size header.
-            if pos + constants.CENHDR > len(cd_data):
-                raise ValueError("Incomplete central directory entry")
-            entry = ZipEntry()
-            entry.read_header(cd_data, pos)
-            pos += constants.CENHDR
-
-            # Read variable-length fields (filename, extra field, comment).
-            variable_size = entry.fname_len + entry.extra_len + entry.com_len
-            if pos + variable_size > len(cd_data):
-                raise ValueError("Corrupted central directory entry")
-            entry.read(cd_data, pos, self.encoding)
-            pos += variable_size
-
-            if self.store_entries:
-                self.entries[entry.name] = entry
+        if self.lazy_entries:
+            # Use a memoryview to avoid unnecessary data copying.
+            cd_data = memoryview(self._fp.read(cd_size))
+            pos = 0
+            entry_count = self._central_dir_header.volume_entries
+            for _ in range(entry_count):
+                # Each entry must have at least the fixed-size header
+                if pos + constants.CENHDR > len(cd_data):
+                    raise ValueError("Incomplete central directory entry")
+                entry = ZipEntry()
+                # Parse fixed header fields
+                entry.read_header(cd_data, pos)
+                pos_header_end = pos + constants.CENHDR
+                # Only decode the filename to enable indexing.
+                fname_data = cd_data[pos_header_end : pos_header_end + entry.fname_len]
+                entry.name = fname_data.tobytes().decode(
+                    self.encoding, errors="replace"
+                )
+                # Store lazy information for deferred parsing.
+                entry._cd_data = (
+                    cd_data  # the entire central directory block (as memoryview)
+                )
+                entry._variable_offset = (
+                    pos_header_end  # start of variable part (filename, extra, comment)
+                )
+                entry._variable_size = entry.fname_len + entry.extra_len + entry.com_len
+                entry._parsed_lazy = (
+                    False  # marks that extra and comment haven't been parsed yet
+                )
+                pos = pos_header_end + entry._variable_size
+                if self.store_entries:
+                    self.entries[entry.name] = entry
+        else:
+            cd_data = self._fp.read(cd_size)
+            pos = 0
+            entry_count = self._central_dir_header.volume_entries
+            for _ in range(entry_count):
+                if pos + constants.CENHDR > len(cd_data):
+                    raise ValueError("Incomplete central directory entry")
+                entry = ZipEntry()
+                entry.read_header(cd_data, pos)
+                pos += constants.CENHDR
+                variable_size = entry.fname_len + entry.extra_len + entry.com_len
+                if pos + variable_size > len(cd_data):
+                    raise ValueError("Corrupted central directory entry")
+                entry.read(cd_data, pos, self.encoding)
+                pos += variable_size
+                if self.store_entries:
+                    self.entries[entry.name] = entry
 
     def entry(self, name):
         """
@@ -153,15 +183,8 @@ class StreamZip:
     def open_entry(self, entry):
         """
         Open an entry and verify its local file header.
-
-        Process:
-          1. If a name is provided, lookup the corresponding ZipEntry.
-          2. Check that the entry is not a directory.
-          3. Seek to the local header offset specified in the entry.
-          4. Read the fixed-size local header.
-          5. Validate the header signature.
-          6. Process additional header fields from the local header.
-          7. Compute the data offset (after local header, filename, and extra field).
+        Before processing, if the entry was lazy-loaded, ensure it has been fully parsed.
+        Returns the data offset (position where file data starts).
         """
         if isinstance(entry, str):
             entry_obj = self.entry(entry)
@@ -170,16 +193,18 @@ class StreamZip:
         else:
             entry_obj = entry
 
+        # For lazy entries, ensure variable fields are parsed.
+        if hasattr(entry_obj, "_parsed_lazy") and not entry_obj._parsed_lazy:
+            entry_obj.ensure_parsed(self.encoding)
+
         if entry_obj.is_directory:
             raise ValueError("Entry is a directory")
 
         self._fp.seek(entry_obj.offset)
         local_header = self._fp.read(constants.LOCHDR)
-        # Validate that the header begins with the expected local file signature.
         if utils.read_uint32_le(local_header, 0) != constants.LOCSIG:
             raise ValueError("Local header signature mismatch")
         entry_obj.read_data_header(local_header)
-        # Compute where the actual file data starts.
         data_offset = (
             entry_obj.offset
             + constants.LOCHDR
